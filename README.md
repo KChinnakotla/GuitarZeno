@@ -1,23 +1,23 @@
-# GuitarZeno 🎸
+# GuitarZeno
 
 A modern, AI-powered guitar learning application with adaptive curriculum, real-time feedback, and multiple learning modes.
 
 ## Features
 
-### 🎓 Lesson Plan Mode
+### Lesson Plan Mode
 - Structured curriculum with 6 lessons and 17 sublessons
 - Progressive unlocking system
 - Interactive practice components
 - Real-time feedback and goal tracking
 
-### 🎵 Teach Me This Song Mode
+### Teach Me This Song Mode
 - Learn any song with step-by-step guidance
 - AI song suggestions based on preferences
 - Real-time chord accuracy feedback
 - Section looping for difficult parts
 - Tempo and strumming pattern analysis
 
-### 🎸 Freeplay Mode
+### Freeplay Mode
 - Real-time video feed from camera
 - Live chord detection from Arduino
 - Strumming detection via Mediapipe
