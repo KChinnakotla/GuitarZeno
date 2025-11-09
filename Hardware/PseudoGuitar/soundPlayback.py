@@ -2,6 +2,9 @@ from pydub import AudioSegment
 import simpleaudio as sa
 import threading
 import time
+import logging
+
+logger = logging.getLogger("soundPlayback")
 
 class RealTimeStrumPlayer:
     def __init__(self, file_path):
@@ -16,20 +19,27 @@ class RealTimeStrumPlayer:
         # play a portion of the file from given progress
         start_ms = int(start_progress * self.duration_ms)
         segment = self.sound[start_ms:]
-        play_obj = sa.play_buffer(
-            segment.raw_data,
-            num_channels=segment.channels,
-            bytes_per_sample=segment.sample_width,
-            sample_rate=segment.frame_rate
-        )
-        return play_obj
+        try:
+            play_obj = sa.play_buffer(
+                segment.raw_data,
+                num_channels=segment.channels,
+                bytes_per_sample=segment.sample_width,
+                sample_rate=segment.frame_rate
+            )
+            return play_obj
+        except Exception as e:
+            logger.warning(f"Failed to play audio segment: {e}")
+            return None
 
     def start(self):
         # begin playback from start (non-blocking)
         self.stop_event.clear()
-        self.play_obj = self.play_segment(0.0)
-        self.play_thread = threading.Thread(target=self._monitor)
-        self.play_thread.start()
+        try:
+            self.play_obj = self.play_segment(0.0)
+            self.play_thread = threading.Thread(target=self._monitor, daemon=True)
+            self.play_thread.start()
+        except Exception as e:
+            logger.warning(f"Error starting playback: {e}")
 
     def _monitor(self):
         # keep playback running until stopped

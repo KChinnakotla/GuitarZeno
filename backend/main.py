@@ -2,6 +2,7 @@
 FastAPI backend for GuitarZeno hardware integration
 Handles video streaming, chord detection, and strumming detection
 """
+import os
 import asyncio
 import base64
 import cv2
@@ -10,6 +11,8 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+# Reduce TensorFlow/MediaPipe C++ logs where possible
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 import mediapipe as mp
 import serial
 import threading
@@ -18,6 +21,9 @@ from collections import deque
 from typing import Optional
 import sys
 import os
+import logging
+from copy import deepcopy
+import numbers
 
 # Add Hardware directory to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'Hardware', 'PseudoGuitar'))
@@ -26,11 +32,18 @@ try:
     from chordDetection import ChordDetector
     from soundPlayback import RealTimeStrumPlayer
 except ImportError:
-    print("Warning: Could not import hardware modules. Running in mock mode.")
+    logging.warning("Could not import hardware modules. Running in mock mode.")
     ChordDetector = None
     RealTimeStrumPlayer = None
 
 app = FastAPI()
+
+# Configure logging
+logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger("backend")
+
+# Lock for serializing access to the camera device
+capture_lock = threading.Lock()
 
 # CORS middleware
 app.add_middleware(
@@ -77,6 +90,28 @@ velocity_threshold = manual_velocity_threshold
 thumb_noise_threshold = manual_thumb_noise_threshold
 strum_distance = manual_strum_distance
 
+# Serial port to use for the chord detector (change this to your Arduino's COM port)
+CHORD_SERIAL_PORT = "COM3"
+
+# Capture / processing tuning
+CAP_WIDTH = 640
+CAP_HEIGHT = 480
+PROCESS_FPS = 10
+PROCESS_INTERVAL = 1.0 / PROCESS_FPS
+# Turn off drawing to reduce CPU cost when debugging performance
+DRAW_LANDMARKS = True
+
+# Shared last-processed frame + detection data (so we don't read/process camera twice)
+last_processed_frame_bytes = None
+last_detection_data = {
+    "chord": "None",
+    "strum_direction": None,
+    "strum_detected": False,
+    "velocity": 0.0,
+    "thumb_extended": False,
+}
+last_process_time = 0.0
+
 def initialize_hardware():
     """Initialize Mediapipe and camera"""
     global hands_detector, mp_hands, mp_drawing, video_capture, chord_detector
@@ -84,16 +119,18 @@ def initialize_hardware():
     # Initialize Mediapipe
     try:
         mp_hands = mp.solutions.hands
+        # Use a lighter model for better performance on CPU
         hands_detector = mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
+            model_complexity=0,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.4
         )
         mp_drawing = mp.solutions.drawing_utils
-        print("Mediapipe initialized successfully")
+        logging.info("Mediapipe initialized successfully")
     except Exception as e:
-        print(f"Warning: Could not initialize Mediapipe: {e}")
+        logging.warning(f"Could not initialize Mediapipe: {e}")
         hands_detector = None
         mp_hands = None
         mp_drawing = None
@@ -103,29 +140,38 @@ def initialize_hardware():
         cap = cv2.VideoCapture(cam_idx)
         if cap.isOpened():
             video_capture = cap
-            print(f"Camera opened at index {cam_idx}")
+            # set a moderate capture resolution to reduce processing cost
+            try:
+                video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
+                video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
+                # Request a higher capture fps if supported
+                video_capture.set(cv2.CAP_PROP_FPS, 30)
+            except Exception:
+                pass
+            logging.info(f"Camera opened at index {cam_idx}")
             break
     
     if video_capture is None:
-        print("Warning: Could not open camera. Running in mock mode.")
+        logging.warning("Could not open camera. Running in mock mode.")
         return False
     
     # Initialize chord detector (try different ports)
     if ChordDetector:
         try:
             # Try common serial ports
-            ports = ['/dev/cu.usbserial-0001', '/dev/ttyUSB0', 'COM3', 'COM4']
+            # Try the configured port first, then fall back to common alternatives
+            ports = [CHORD_SERIAL_PORT, '/dev/cu.usbserial-0001', '/dev/ttyUSB0', 'COM4']
             for port in ports:
                 try:
                     chord_detector = ChordDetector(port=port, baud_rate=115200)
-                    print(f"Chord detector initialized on {port}")
+                    logging.info(f"Chord detector initialized on {port}")
                     break
                 except:
                     continue
             if chord_detector is None:
-                print("Warning: Could not initialize chord detector. Running without it.")
+                logging.warning("Could not initialize chord detector. Running without it.")
         except Exception as e:
-            print(f"Warning: Chord detector error: {e}")
+            logging.warning(f"Chord detector error: {e}")
     
     return True
 
@@ -145,9 +191,32 @@ def process_frame(frame):
             "thumb_extended": False
         }
     
+    # Validate frame before processing
+    if frame is None or not hasattr(frame, 'shape') or frame.size == 0:
+        # Empty frame — skip processing to avoid MediaPipe packet errors
+        logging.debug("Empty frame received; skipping MediaPipe processing")
+        return frame, {
+            "chord": chord_detector.get_current_chord() if chord_detector else "None",
+            "strum_direction": None,
+            "strum_detected": False,
+            "velocity": 0.0,
+            "thumb_extended": False
+        }
+
     frame = cv2.flip(frame, 1)
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands_detector.process(rgb_frame)
+    try:
+        results = hands_detector.process(rgb_frame)
+    except Exception as e:
+        # MediaPipe can raise packet type mismatch if given empty/invalid frames
+        logging.warning(f"MediaPipe processing error: {e}")
+        return frame, {
+            "chord": chord_detector.get_current_chord() if chord_detector else "None",
+            "strum_direction": None,
+            "strum_detected": False,
+            "velocity": 0.0,
+            "thumb_extended": False
+        }
     
     detected_chord = "None"
     strum_direction = None
@@ -257,9 +326,9 @@ def process_frame(frame):
                                 strum_start_y = hand_center[1]
                                 strum_in_progress = True
                             except Exception as e:
-                                print(f"Error playing sound: {e}")
+                                logging.warning(f"Error playing sound: {e}")
                         else:
-                            print(f"Sound file not found: {file_path}")
+                            logging.debug(f"Sound file not found: {file_path}")
                     
                     hand_positions.append(hand_center)
                     expected_direction_down = not expected_direction_down
@@ -304,6 +373,7 @@ def process_frame(frame):
 def generate_frames():
     """Generator for video frames"""
     global video_capture, is_running
+    global last_processed_frame_bytes, last_detection_data, last_process_time
     
     if video_capture is None:
         # Return a black frame if no camera
@@ -319,24 +389,38 @@ def generate_frames():
         return
     
     while is_running:
-        ret, frame = video_capture.read()
+        with capture_lock:
+            ret, frame = video_capture.read()
         if not ret:
             # Try to reinitialize camera
-            time.sleep(0.1)
+            time.sleep(0.05)
             continue
-        
-        try:
-            processed_frame, detection_data = process_frame(frame)
-            
-            # Encode frame
-            _, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            frame_bytes = buffer.tobytes()
-            
+
+        now = time.time()
+        # Only process at the configured PROCESS_FPS to reduce CPU load
+        if now - last_process_time >= PROCESS_INTERVAL:
+            try:
+                processed_frame, detection_data = process_frame(frame)
+                _, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                last_processed_frame_bytes = buffer.tobytes()
+                last_detection_data = detection_data
+                last_process_time = now
+            except Exception as e:
+                logging.warning(f"Error processing frame: {e}")
+                # fall back to raw frame encoding
+                try:
+                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    last_processed_frame_bytes = buffer.tobytes()
+                except Exception:
+                    last_processed_frame_bytes = None
+
+        # Yield the latest encoded frame (processed or fallback)
+        if last_processed_frame_bytes:
             yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        except Exception as e:
-            print(f"Error processing frame: {e}")
-            time.sleep(0.1)
+                   b'Content-Type: image/jpeg\r\n\r\n' + last_processed_frame_bytes + b'\r\n')
+        else:
+            # safety fallback
+            time.sleep(0.01)
             continue
 
 @app.on_event("startup")
@@ -383,40 +467,58 @@ async def websocket_endpoint(websocket: WebSocket):
     
     last_frame_time = 0
     frame_interval = 1.0 / 10  # 10 Hz
+    # Use the central cached detection data instead of re-reading camera
     
     try:
+        sent_prev = None
         while is_running:
             current_time = time.time()
             if current_time - last_frame_time >= frame_interval:
-                # Send detection data periodically
-                if video_capture:
-                    ret, frame = video_capture.read()
-                    if ret:
-                        try:
-                            _, detection_data = process_frame(frame)
-                            await websocket.send_json(detection_data)
+                # Send cached detection data periodically
+                try:
+                    payload = deepcopy(last_detection_data) if last_detection_data else None
+                    if payload is not None:
+                        # sanitize payload to JSON-safe primitives
+                        for k, v in list(payload.items()):
+                            if isinstance(v, np.generic):
+                                payload[k] = v.item()
+                            elif isinstance(v, numbers.Number) and not isinstance(v, (int, float)):
+                                try:
+                                    payload[k] = float(v)
+                                except Exception:
+                                    payload[k] = v
+
+                        # Only send if changed to reduce traffic
+                        if payload != sent_prev:
+                            await websocket.send_json(payload)
+                            sent_prev = payload
                             last_frame_time = current_time
-                        except Exception as e:
-                            print(f"Error processing frame for WebSocket: {e}")
-                
-                # Also send current chord if available
-                if chord_detector:
-                    chord = chord_detector.get_current_chord() or "None"
-                    if chord != "None":
-                        await websocket.send_json({
-                            "chord": chord,
-                            "strum_direction": None,
-                            "strum_detected": False,
-                            "velocity": 0.0,
-                            "thumb_extended": False
-                        })
-            
+                except WebSocketDisconnect:
+                    raise
+                except Exception:
+                    logging.exception("Error sending detection payload over WebSocket")
+
+                # Also send current chord if available (one-off)
+                try:
+                    if chord_detector:
+                        chord = chord_detector.get_current_chord() or "None"
+                        if chord != "None":
+                            await websocket.send_json({
+                                "chord": chord,
+                                "strum_direction": None,
+                                "strum_detected": False,
+                                "velocity": 0.0,
+                                "thumb_extended": False
+                            })
+                except Exception:
+                    logging.exception("Error sending chord update over WebSocket")
+
             await asyncio.sleep(0.05)  # Check every 50ms
     except WebSocketDisconnect:
-        active_connections.remove(websocket)
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-        active_connections.remove(websocket)
+        active_connections.discard(websocket)
+    except Exception:
+        logging.exception("WebSocket error")
+        active_connections.discard(websocket)
 
 @app.post("/start")
 async def start_detection():
