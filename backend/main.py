@@ -8,7 +8,7 @@ import base64
 import cv2
 import json
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 # Reduce TensorFlow/MediaPipe C++ logs where possible
@@ -35,6 +35,8 @@ except ImportError:
     logging.warning("Could not import hardware modules. Running in mock mode.")
     ChordDetector = None
     RealTimeStrumPlayer = None
+
+from .openrouter_api import get_chord_progression, get_feedback, get_song_recommendation
 
 app = FastAPI()
 
@@ -533,6 +535,28 @@ async def stop_detection():
     global is_running
     is_running = False
     return {"status": "stopped"}
+
+@app.post("/api/teach-song")
+async def api_teach_song(request: Request):
+    data = await request.json()
+    song_name = data.get("song_name", "")
+    result = get_chord_progression(song_name)
+    return {"result": result}
+
+@app.post("/api/feedback")
+async def api_feedback(request: Request):
+    data = await request.json()
+    played_chord = data.get("played_chord", "")
+    expected_chord = data.get("expected_chord", "")
+    result = get_feedback(played_chord, expected_chord)
+    return {"result": result}
+
+@app.post("/api/recommend-song")
+async def api_recommend_song(request: Request):
+    data = await request.json()
+    query = data.get("query", "")
+    result = get_song_recommendation(query)
+    return {"result": result}
 
 if __name__ == "__main__":
     import uvicorn

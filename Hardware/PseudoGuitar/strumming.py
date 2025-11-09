@@ -185,18 +185,18 @@ while cap.isOpened():
                 if valid_thumb_motion and current_direction_down == expected_direction_down:
                     # Successful strum
                     print(f"Successful strum! Direction: {'Down' if current_direction_down else 'Up'} Time: {strum_start_time}")
-                    # TODO: play sound here based on smoothed_velocity
-                    # detect chord to play
                     chord = detector.get_current_chord()
 
                     if chord == "None" or chord == "":
-                            # No valid chord detected, skip playing sound
-                            current_player = None
-                            strum_in_progress = False
-                            print("No chord detected. Skipping sound.")
-
+                        if current_player:
+                            current_player.stop()
+                        current_player = None
+                        strum_in_progress = False
+                        print("No chord detected. Skipping sound.")
                     else:
-                        ## if its down strum add _down else _up
+                        # Always stop previous player before starting new one
+                        if current_player:
+                            current_player.stop()
                         if current_direction_down:
                             file_path = chord + "_down.wav"
                         else:

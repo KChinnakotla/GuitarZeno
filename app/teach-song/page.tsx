@@ -19,6 +19,45 @@ import Navigation from '@/components/Navigation'
 import ChordDisplay from '@/components/ChordDisplay'
 import FeedbackIndicator from '@/components/FeedbackIndicator'
 
+// Utility to call backend
+async function fetchChordProgression(songName: string) {
+  const res = await fetch("/api/teach-song", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ song_name: songName })
+  })
+  const data = await res.json()
+  return data.result
+}
+
+async function fetchFeedback(playedChord: string, expectedChord: string) {
+  const res = await fetch("/api/feedback", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ played_chord: playedChord, expected_chord: expectedChord })
+  })
+  const data = await res.json()
+  return data.result
+}
+
+async function fetchSongRecommendation(query: string) {
+  const res = await fetch("/api/recommend-song", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query })
+  })
+  const data = await res.json()
+  return data.result
+}
+
+function speakText(text: string) {
+  if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    const utterance = new window.SpeechSynthesisUtterance(text);
+    utterance.lang = 'en-US';
+    window.speechSynthesis.speak(utterance);
+  }
+}
+
 export default function TeachSongPage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [isPlaying, setIsPlaying] = useState(false)
@@ -33,6 +72,9 @@ export default function TeachSongPage() {
     difficulty: string
   } | null>(null)
   const [loopSection, setLoopSection] = useState(false)
+  const [aiChordProgression, setAiChordProgression] = useState<string>("");
+  const [aiFeedback, setAiFeedback] = useState<string>("");
+  const [aiRecommendation, setAiRecommendation] = useState<string>("");
 
   // Mock suggested songs
   const suggestedSongs = [
@@ -43,30 +85,32 @@ export default function TeachSongPage() {
     { title: 'House of the Rising Sun', artist: 'The Animals', difficulty: 'Intermediate' },
   ]
 
-  // Mock song data
-  const mockSongData = {
-    title: 'Wonderwall',
-    artist: 'Oasis',
-    chords: ['Am', 'C', 'G', 'D', 'Am', 'C', 'G', 'D'],
-    tempo: 120,
-    strummingPattern: 'Down Down Up Up Down Up',
-    difficulty: 'Intermediate',
-  }
-
-  const handleSearch = (e: React.FormEvent) => {
+  const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault()
     if (searchQuery) {
-      // Simulate song selection
-      setSelectedSong(mockSongData)
-      setCurrentChordIndex(0)
+      // Call backend for chord progression
+      const progression = await fetchChordProgression(searchQuery);
+      setAiChordProgression(progression);
+      speakText(progression);
+      setSelectedSong({
+        title: searchQuery,
+        artist: "",
+        chords: progression.split(/\s|,|\n/).filter(Boolean),
+        tempo: 120,
+        strummingPattern: "",
+        difficulty: "Unknown",
+      });
+      setCurrentChordIndex(0);
     }
   }
 
   const handleSelectSong = (song: typeof suggestedSongs[0]) => {
     setSelectedSong({
-      ...mockSongData,
       title: song.title,
       artist: song.artist,
+      chords: [],
+      tempo: 120,
+      strummingPattern: "",
       difficulty: song.difficulty,
     })
     setCurrentChordIndex(0)
@@ -76,22 +120,23 @@ export default function TeachSongPage() {
     setIsPlaying(!isPlaying)
   }
 
-  const handleNextChord = () => {
+  const handleNextChord = async () => {
     if (selectedSong && currentChordIndex < selectedSong.chords.length - 1) {
-      setCurrentChordIndex(currentChordIndex + 1)
-      // Simulate feedback
-      const randomFeedback = Math.random()
-      if (randomFeedback > 0.7) {
-        setFeedback('correct')
-        setTimeout(() => setFeedback(null), 2000)
-      } else if (randomFeedback > 0.4) {
-        setFeedback('warning')
-        setTimeout(() => setFeedback(null), 2000)
-      } else {
-        setFeedback('incorrect')
-        setTimeout(() => setFeedback(null), 2000)
-      }
+      const playedChord = selectedSong.chords[currentChordIndex];
+      const expectedChord = selectedSong.chords[currentChordIndex];
+      // Call backend for feedback
+      const feedback = await fetchFeedback(playedChord, expectedChord);
+      setAiFeedback(feedback);
+      speakText(feedback);
+      setCurrentChordIndex(currentChordIndex + 1);
+      setTimeout(() => setAiFeedback(""), 3000);
     }
+  }
+
+  const handleRecommendation = async (query: string) => {
+    const rec = await fetchSongRecommendation(query);
+    setAiRecommendation(rec);
+    speakText(rec);
   }
 
   return (
@@ -139,6 +184,12 @@ export default function TeachSongPage() {
                   Search
                 </button>
               </form>
+              {aiChordProgression && (
+                <div className="mt-6 p-4 bg-gray-900 rounded-xl border border-gray-700">
+                  <h3 className="text-lg font-bold mb-2">AI Chord Progression</h3>
+                  <pre className="whitespace-pre-wrap text-gray-200">{aiChordProgression}</pre>
+                </div>
+              )}
             </motion.div>
 
             {/* AI Suggestions */}
@@ -176,6 +227,20 @@ export default function TeachSongPage() {
                     </div>
                   </motion.div>
                 ))}
+              </div>
+              <div className="mt-8">
+                <input
+                  type="text"
+                  placeholder="Genre, artist, mood..."
+                  className="bg-gray-800 text-white px-4 py-2 rounded-lg"
+                  onBlur={e => handleRecommendation(e.target.value)}
+                />
+                {aiRecommendation && (
+                  <div className="mt-4 p-4 bg-purple-900 rounded-xl border border-purple-700">
+                    <h3 className="text-lg font-bold mb-2">AI Song Recommendation</h3>
+                    <pre className="whitespace-pre-wrap text-gray-200">{aiRecommendation}</pre>
+                  </div>
+                )}
               </div>
             </motion.div>
           </>
@@ -283,6 +348,13 @@ export default function TeachSongPage() {
                     <Repeat className="w-4 h-4 mr-2" />
                     <span className="font-semibold">Looping Section: Chords {currentChordIndex + 1}-{Math.min(currentChordIndex + 4, selectedSong.chords.length)}</span>
                   </div>
+                </div>
+              )}
+
+              {aiFeedback && (
+                <div className="mt-4 p-4 bg-green-900 rounded-xl border border-green-700">
+                  <h3 className="text-lg font-bold mb-2">AI Feedback</h3>
+                  <pre className="whitespace-pre-wrap text-gray-200">{aiFeedback}</pre>
                 </div>
               )}
 
